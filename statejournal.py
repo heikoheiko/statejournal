@@ -151,12 +151,18 @@ class StateJournal(object):
     """
 
 
-    def __init__(self, db, state_digest=empty_state_digest):
+    def __init__(self, db):
         self.journal = open(os.path.join(db.dbfile, self.state_journal_fn), 'a')
         self.journal_index = open(os.path.join(db.dbfile, self.state_journal_index_fn), 'a')
         self.db = db
-        self.state_digest = state_digest
-        self.update_counter = 0
+        l = JournalReader(db).last_update()
+        if l:
+            self.state_digest = l['state_digest']
+            self.update_counter = l['update_counter']
+        else:
+            self.state_digest = self.empty_state_digest
+            self.update_counter = 0
+        print 'uc/state', self.update_counter, self.state_digest.encode('hex')
 
     def get_raw(self, key):
         "returns (value, update_counter)"
@@ -187,8 +193,8 @@ class StateJournal(object):
 
         # store in leveldb
         if value:
-            value = rlp.encode([value, self.update_counter])
-            self.db.put(key, value)
+            _stored_value = rlp.encode([value, self.update_counter])
+            self.db.put(key, _stored_value)
         else:
             self.db.delete(key)
 
@@ -210,6 +216,14 @@ class StateJournal(object):
         assert pos < b32
         idx = zpad(int_to_big_endian(pos), 4)  # 4 bytes
         self.journal_index.write(idx)
+
+        # debug
+        # self.commit()
+        # jr = JournalReader(self.db)
+        # r = jr.read_update(self.update_counter)
+        # assert r['value'] == value
+        # print r
+
 
     def commit(self):
         self.journal_index.flush()
@@ -256,7 +270,7 @@ class StateJournal(object):
         self.journal.seek(log_end_pos)
         self.journal.truncate()
 
-
+EOF = 2
 class JournalReader(object):
     """
 
@@ -267,8 +281,19 @@ class JournalReader(object):
         self.journal_index = open(os.path.join(db.dbfile, StateJournal.state_journal_index_fn),
                                   'r')
 
+    def update_counter(self):
+        self.journal_index.seek(0, EOF)
+        return self.journal_index.tell() / 4
+
+    def last_update(self):
+        uc = self.update_counter()
+        if uc == 0:
+            return {}
+        return self.read_update(uc)
+
     def read_update(self, update_counter):
         "first update has update_counter=1"
+        # assert update_counter > 0
         self.journal_index.seek((update_counter - 1) * 4)
         log_end_pos = big_endian_to_int(self.journal_index.read(4))
         self.journal.seek(log_end_pos - 2)
@@ -279,7 +304,7 @@ class JournalReader(object):
         key, value, prev_update_counter = rlp.decode(log)
         prev_update_counter = big_endian_to_int(prev_update_counter)
         return dict(key=key, value=value, prev_update_counter=prev_update_counter,
-                    state_digest=state_digest, log_hash=sha3(log))
+                    state_digest=state_digest, log_hash=sha3(log), update_counter=update_counter)
 
     def validate_state(self, last_update_counter):
         state_digest = StateJournal.empty_state_digest
@@ -289,7 +314,7 @@ class JournalReader(object):
             state_digest = l['state_digest']
         return state_digest
 
-    def get_spv(self, update_counter_start):
+    def get_ssv(self, update_counter_start):
         """
         returns all hashes from a given value up to the current state.
         recursively hasing them up should lead to the current state root.

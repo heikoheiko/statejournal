@@ -229,7 +229,7 @@ def test_statejournal_read(chain):
     state = lr.validate_state(sj.update_counter)
     assert state == sj.state
 
-    #  get spv ################
+    #  get ssv ################
     for i in range(config['num_accounts']):
         account = Account(chain, i)
         keys = account.keys()
@@ -239,7 +239,7 @@ def test_statejournal_read(chain):
     print 'keys found', account
     k = keys[0]
     val, update_counter = sj.get_raw(k)
-    proof = lr.get_spv(update_counter)
+    proof = lr.get_ssv(update_counter)
     assert proof['value'] == val
     hash_chain = proof['hash_chain']
     assert len(hash_chain)
@@ -279,6 +279,8 @@ def test_update(chain, accounts, storage_slots):
         for k in accounts:
             counter += 1
             v = int_to_big_endian(counter)
+            # r = chain.storage.get(k+v)
+            # assert r == v, (r, v)
             v2 = int_to_big_endian(counter + 1)
             chain.storage.update(k+v, v2)
             if counter == storage_slots:
@@ -294,9 +296,43 @@ def test_delete(chain, accounts, storage_slots):
             if counter == storage_slots:
                 return chain
 
+def test_ssv(chain, accounts, storage_slots):
+    # get log reader
+    sj = chain.storage.db  # state journal
+    sj.commit()
+    lr = statejournal.JournalReader(sj.db)
+
+    # validate full chain
+    if False:
+        state = lr.validate_state(sj.update_counter)
+        assert state == sj.state_digest
+        assert state == lr.last_update()['state_digest']
+
+    #  get ssv ################
+
+    # read first (oldest entry)
+    counter = 1
+    k = accounts[0]
+    v = int_to_big_endian(counter)
+    k += v
+
+    # get the proof
+    val, update_counter = sj.get_raw(k)
+    proof = lr.get_ssv(update_counter)
+    assert proof['value'] == val, (big_endian_to_int(proof['value']), val)
+    hash_chain = proof['hash_chain']
+    assert len(hash_chain)
+    s = hash_chain[0]
+    for h in hash_chain[1:]:
+        s = sha3(s + h)
+    assert s == sj.state_digest
+
+
 def do_test():
-    # h = "create|read|update|delete trie|journal num_slots num_accounts path"
-    # print sys.argv[0], h
+    if len(sys.argv) != 6:
+        h = "create|read|update|delete|ssv trie|journal num_slots num_accounts path"
+        print sys.argv[0], h
+        sys.exit(1)
     print sys.argv
 
     task, tech, storage_slots, num_accounts, path = sys.argv[1:]
@@ -328,6 +364,9 @@ def do_test():
         test_update(chain, accounts, storage_slots)
     elif task == 'delete':
         test_delete(chain, accounts, storage_slots)
+    elif task == 'ssv':
+        assert tech == 'journal', 'ssv only available with journal'
+        test_ssv(chain, accounts, storage_slots)
     else:
         raise Exception('unknown')
 
@@ -335,6 +374,12 @@ def do_test():
         # store state root
         sr = chain.storage.db.root_hash
         chain.storage.db.db.put('STATE_ROOT', sr)
+    else:
+        sj = chain.storage.db
+        print 'uc/state', sj.update_counter, sj.state_digest.encode('hex')
+
+    chain.storage.commit()
+    print chain.storage.db.db.db.GetStats()
 
     return chain
 
@@ -362,109 +407,3 @@ def test_fake_chain():
 if __name__ == '__main__':
     chain = do_test()
     report(chain)
-
-"""
-Test 1Mio Writes / Reads w/ 1k accounts
-
-
-Trie:
-memory usage 924
-1000000 app reads
-9610120 db reads
-1000000 app writes
-11947818 db writes
-1000000 storage locations
-python chainmock.py testt  687,75s user 188,99s system 158% cpu 9:13,01 total
-2,6G    testt
-
-Trie Read:
-memory usage 1758
-python chainmock.py testt  150s user 110s system
-
-
-Journal:
-memory usage 483
-1000000 app reads
-2000000 db reads
-1000000 app writes
-1000000 db writes
-1000000 storage locations
-python chainmock.py testj  47,45s user 2,19s system 107% cpu 46,006 total
-115M    testj (86gb state journal) = 29M
-
-Journal Read:
-memory usage 665
-1000000 app reads
-1000000 db reads
-python chainmock.py testj  18,90s user 0,78s system 100% cpu 19,606 total
-
-Size:
-11M / 2,6GB = x236
-30M / 2,6GB = x85
-51M / 2,6GB = x50
-137M / 2,6GB = x19 (worst case with log)
-
-Write:
-875 / 50 = x17.5
-Read:
-260 / 20 = x13
-
-----------------------
-
-Test 1Mio Writes / Reads w/ ONE account
-Journal:
-97M    testj (86gb state journal) = 11M
-
-Test 1Mio Writes / Reads w/ 1M account
-Journal:
-137M    testj (86gb state journal) = 51M
-
-
-Test w/ 2x updates
-
-
-
-
-
-Trie:
-------------------
-2789094 app reads
-17959499 db reads
-883654 app writes
-10508762 db writes
-1163 app deletes
-605587 app misses
-194406 transactions
-10000 blocks
-605314 storage locations
-python chainmock.py testt  953,67s user 259,22s system 137% cpu 14:44,01 total
-(pypy) ~/dev/ethereum/hashjournal (git)-[master] % du -h testt
-2,2G    testt
-
-(same size with compression turned on)
-
-State Journal:
-------------------
-2789094 app reads
-3673911 db reads
-883654 app writes
-883654 db writes
-1163 app deletes
-605587 app misses
-194406 transactions
-10000 blocks
-605314 storage locationsl
-python chainmock.py testj  85,06s user 2,86s system 109% cpu 1:20,32 total
-(pypy) ~/dev/ethereum/hashjournal (git)-[master] % du -h testj
-103M    testj
-(pypy) ~/dev/ethereum/hashjournal (git)-[master] % ls -al testj/state_journal*
--rw-r--r--  1 heiko  staff  91532758 31 Mai 10:49 testj/state_journal
--rw-r--r--  1 heiko  staff   3539268 31 Mai 10:49 testj/state_journal.idx
-(pypy) ~/dev/ethereum/hashjournal (git)-[master] %
-
-Results:
-    StateJournal is
-    10x faster (for mixed read/writes)
-    20x smaller if keeping the log
-    250x smaller if pruning the log for old finalized states
-"""
