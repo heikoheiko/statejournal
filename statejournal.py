@@ -9,11 +9,13 @@ Efficient journal based cryptographically authenticated data structure
 
 The basic idea is to update a hash function with the stream of state updates,
 which are written to a journal, instead of using a merkel tree.
-While the latter is good at supporting access to different states it has severe
-runtime, memory and storage penalties.
+The current state is directly mapped to a key value store.
+
+While the Merkel Patricia Tree is good at supporting access to states in different chains,
+it has runtime, memory and storage issues.
 
 
-Improvements:
+Potential Improvements:
     - x50 lower storage requirements (x20 if keeping the full journal, x1000 if deleting storage)
     - x12/x17 faster for reads/writes
     - x135/x70 lower system IO for reads/writes
@@ -26,17 +28,14 @@ The storage improvements are due to
     - compressable keys, b/c keys to account storage location can share the same prefix
 
 Limitation:
-    - For O(log(n)) SPVs one of the queried peers must be honest,
-         when requesting a current state value
-    - If only the current state root can be trusted, SPV takes O(age)
-
+    - Rollbacks to unexpectedly old state (i.e. to uncached state) are expensive
 
 Design Goals:
     - minimal footprint for the current state
     - fast read / write access
     - pruning old data (deleted state, blocks, txs, accounts) should be possible
     - suitable for DHT based long term storage of old data
-    - fast reconstruction of the current state w/o going through the vm
+    - fast reconstruction of the current state (syncing) w/o going through the vm
 
 Base assumptions:
     - in a practical BC system state is final after N blocks
@@ -44,8 +43,7 @@ Base assumptions:
     - hashes are non compressable and slow, use them sparsely
     - checking current state and computing new states happens frequently and should be fast
     - querying recent states (chain branch switch) happens frequently and should be fast
-    - querying old states
-        - happens infrequently (spv) and linear O(age) is acceptable for most use cases
+    - querying old states happens infrequently (SSV)
 
 Implementation:
     - split current state and historical states
@@ -54,12 +52,12 @@ Implementation:
         - old blocks, txs, receipts is historical state
     - use a hash digest to track state updates H(H'|H(update))
     - keys, values are directly mapped to leveldb
-    - an update counter (as part of the value) is used to reference older states
+    - an update counter (stored next to the value) is used to reference older states
     - recover old states by
         - using in memory snapshots (for up to N blocks)
         - backward reading the journal
     - all state changes are written to a journal
-    - to support log(n) SPVs
+    - to support log(n) SSVs
       the journal merges in state_digests at tx and block boundaries (see below)
 
 Changes to the current Ethereum protocol:
@@ -68,7 +66,7 @@ Changes to the current Ethereum protocol:
         - change: tx_list_root becomes H(H(tx0), ... H(txN))
         - change: receipts_root becomes H(H(R0), ... H(RN))
         - add: update_counter
-        - add: state_digest of a second prev block (so we get a tree structure for log(n) SPVs)
+        - add: state_digest of a second prev block (so we get a tree structure for log(n) SSVs)
                referenced block number is the highest divisor of the current block number
                for divisors in [2^0, 2^1, ... 2^n]
     - tx receipts:
@@ -79,22 +77,21 @@ Changes to the Ethereum implementation:
     - Changes to block header and tx receipt
     - StateJournal replaces Trie
     - blocks that are not yet considered to be in the final chain
-      need to cache their state updates in memory (or another StateJournal)
+      need to cache their state updates in memory (or a dedicated StateJournal)
 
-SPV:
-    A light client wants a SPV for a (value, update_counter) tuple.
-        Client asks the network for a SPV, receives the chain of state_digests from the
-            last value change to the current state_digest.
+Simplified State Verification (SSV):
+    A light client wants a SSV for a (value, update_counter) tuple.
+        Client asks the network for a SSV, receives the shortest chain of state_digests from the
+            last value change to the current state_digest (stored in the latest block).
         The recursively hashed state_digests must match the current state_digest.
 
     A light client wants to know the current state of an account property:
         Client asks the network with a key corresponding to the account property
             for (value, update_counter). At least one answer must be honest.
-        Client asks the network for a SPV.
+        Client asks the network for a SSV.
 
     A light client wants to download/check a transaction/block_header.
-        Same as above but with the transaction/block_header hash as the key.
-        This can be done recursively to download all block_headers / txs.
+        Roughly the same as above but with the transaction/block_header hash as the key.
 
     A light client wants to know an old state of an account property at `target update_counter`:
         Get the current state which contains the `previous update_counter`.
@@ -104,9 +101,13 @@ SPV:
             Ask the network for the journal entry at `previous update_counter`
 
     Light clients want to collectively validate a block or watch updates
-        Download and spv the necessary data.
+        Download and SSV the necessary data.
 
-DHT based State Journal:
+DHT based StateJournal:
+    update_counter => [state_digest, key, value, old_counter]
+
+    For every entry to be stored a SSV is necessary.
+    Only updates from blocks which are considered final should be added to the DHT.
 
 
 """
@@ -127,7 +128,7 @@ class StateJournal(object):
     A StateJournal (continuing from the previous one) can be created for every block and deleted
         once the block is considered to be in the final chain.
 
-    SPVs are supported by
+    SSVs are supported by
         - providing a (value, update_counter) tuple and the current state_digest
         - traversing the journal up to the current state_digest
 
